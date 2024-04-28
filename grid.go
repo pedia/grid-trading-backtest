@@ -33,7 +33,7 @@ type Order struct {
 	Side     Side
 	Price    float64
 	Quantity float64
-	QuoteQty float64
+	Quote    float64
 	DealTime time.Time
 }
 
@@ -42,8 +42,8 @@ type Order struct {
 type Trade struct {
 	Id           int
 	Price        float64
-	Qty          float64
-	QuoteQty     float64
+	Quantity     float64
+	Quote        float64
 	Time         time.Time
 	IsBuyerMaker bool
 }
@@ -52,8 +52,9 @@ var ErrLiquidated = errors.New("liquidated")
 var ErrOutOfRange = errors.New("out of range")
 
 type Pnl struct {
-	Fee    float64
-	Profit float64
+	Fee        float64
+	Profit     float64
+	TradeCount int
 }
 
 type Strategy interface {
@@ -89,18 +90,19 @@ func NewGrid(low, high float64, number int) *Grid {
 
 		InitialMargin: 5000,
 		Current:       -1,
-		Quantity:      816.32654,
+		// InitialMargin * Leverage / Number
+		Quantity: float64(5000*100) / float64(number),
 	}
 }
 
-func (g *Grid) Enter(price float64) {
-	g.EntryPrice = price
-	g.LastPrice = price
+func (g *Grid) Enter(entry_price float64) {
+	g.EntryPrice = entry_price
+	g.LastPrice = entry_price
 
-	grid := g.grid()
+	segment := g.grid()
 	side := Buy
 	for i := 0; i < g.Number+1; i++ {
-		price := g.Low + float64(i)*grid
+		price := g.Low + float64(i)*segment
 
 		if side == Buy && price > g.LastPrice {
 			side = Sell
@@ -109,7 +111,7 @@ func (g *Grid) Enter(price float64) {
 				Side:     Unknown,
 				Price:    price,
 				Quantity: g.Quantity,
-				QuoteQty: g.Quantity / price,
+				Quote:    g.Quantity / price,
 			})
 			continue
 		}
@@ -118,15 +120,11 @@ func (g *Grid) Enter(price float64) {
 			Side:     side,
 			Price:    price,
 			Quantity: g.Quantity,
-			QuoteQty: g.Quantity / price,
+			Quote:    g.Quantity / price,
 		})
 	}
 }
 
-func (g *Grid) place(side Side, n int) {
-	g.PendingOrders[g.Current].Side = Unknown
-	g.PendingOrders[n].Side = side
-}
 func (g *Grid) check() bool {
 	// TODO:
 	// https://www.binance.com/en/support/faq/how-to-calculate-liquidation-price-of-usd%E2%93%A2-m-futures-contracts-b3c689c1f50a44cabb3a84e663b81d93
@@ -139,13 +137,13 @@ func (g *Grid) check() bool {
 
 		if o.Side == Buy {
 			fee += o.Quantity * 0.0005
-			target += o.QuoteQty
+			target += o.Quote
 			pnl -= o.Quantity
 		} else if o.Side == Sell {
-			q := o.QuoteQty * o.Price
-			target -= o.QuoteQty
-			pnl += q
+			q := o.Quote * o.Price
 			fee += q * 0.0002
+			target -= o.Quote
+			pnl += q
 		}
 	}
 
@@ -165,28 +163,33 @@ func (g *Grid) GetPnl() Pnl {
 
 		if o.Side == Buy {
 			fee += o.Quantity * 0.0005
-			target += o.QuoteQty
+			target += o.Quote
 			pnl -= o.Quantity
 		} else if o.Side == Sell {
-			q := o.QuoteQty * o.Price
-			target -= o.QuoteQty
+			q := o.Quote * o.Price
+			target -= o.Quote
 			pnl += q
 			fee += q * 0.0002
 		}
 	}
-	return Pnl{Fee: fee, Profit: target*g.LastPrice + pnl - fee}
+	return Pnl{Fee: fee, Profit: target*g.LastPrice + pnl - fee, TradeCount: len(g.History)}
+}
+
+func (g *Grid) Trade(o Order, t *Tick) {
+	o.DealTime = t.OpenTime
+	g.History.Add(o)
 }
 
 func (g *Grid) OnTick(t *Tick) error {
 	// look up
 	if g.Current >= 0 && g.Current < g.Number && t.Open >= g.PendingOrders[g.Current+1].Price {
-		g.History.Add(g.PendingOrders[g.Current+1])
+		g.Trade(g.PendingOrders[g.Current+1], t)
 		g.PendingOrders[g.Current+1].Side = Unknown
 		g.PendingOrders[g.Current].Side = Buy
 		g.Current++
 		g.LastPrice = t.Open
 	} else if g.Current > 0 && t.Open < g.PendingOrders[g.Current-1].Price {
-		g.History.Add(g.PendingOrders[g.Current-1])
+		g.Trade(g.PendingOrders[g.Current-1], t)
 		g.PendingOrders[g.Current-1].Side = Unknown
 		g.PendingOrders[g.Current].Side = Sell
 		g.Current--
@@ -198,6 +201,7 @@ func (g *Grid) OnTick(t *Tick) error {
 	if !g.check() {
 		return ErrLiquidated
 	}
+	// fmt.Printf("%6.0f %2d %6.0f\n", t.Open, len(g.History), g.GetPnl().Profit)
 	return nil
 }
 
