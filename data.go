@@ -56,6 +56,7 @@ func Read(filename string, co chan Tick) {
 	reader.Read()
 
 	for {
+
 		r, err := reader.Read()
 		if err == io.EOF {
 			break
@@ -63,8 +64,44 @@ func Read(filename string, co chan Tick) {
 		if err != nil {
 			log.Fatal(err)
 		}
+
 		co <- OrderFrom(r)
 	}
 
 	close(co)
+}
+
+type DataBase interface {
+	FetchOne() (Tick, error)
+	Close()
+}
+
+type csv_reader struct {
+	reader *csv.Reader
+}
+
+func OpenCSV(filename string) *csv_reader {
+	f, err := os.OpenFile(filename, os.O_RDONLY, 0666)
+	if err != nil {
+		panic(err)
+	}
+	reader := csv.NewReader(f)
+	reader.ReuseRecord = true
+
+	// skip header
+	reader.Read()
+
+	return &csv_reader{reader: reader}
+}
+
+// io.EOF
+func (c *csv_reader) FetchOne() (Tick, error) {
+	r, err := c.reader.Read()
+	if err != nil {
+		return Tick{}, err
+	}
+	return OrderFrom(r), nil
+}
+func (c *csv_reader) Close() {
+	// close(c.reader)
 }

@@ -1,11 +1,18 @@
 package main
 
-import "grid"
+import (
+	"fmt"
+	"grid"
+)
 
 func main() {
-	ct := make(chan grid.Tick, 1)
-	go grid.Read("data/BTCUSDT-1m-2024-04-19.csv", ct)
+	for n := 30; n < 100; n += 5 {
+		d := grid.OpenCSV("data/BTCUSDT-1m-2024-01.csv")
 
-	t := grid.NewGrid(60000, 66000, 30)
-	grid.Dump(t, ct)
+		t := grid.NewGrid(40000, 43000, n)
+		pnl, err := grid.Run(t, d)
+		fmt.Printf("%02d %8.02f %8.02f %v\n", n, pnl.Fee, pnl.Profit, err)
+
+		d.Close()
+	}
 }

@@ -1,7 +1,8 @@
 package grid
 
 import (
-	"fmt"
+	"errors"
+	"io"
 	"time"
 )
 
@@ -47,10 +48,18 @@ type Trade struct {
 	IsBuyerMaker bool
 }
 
+var ErrLiquidated = errors.New("liquidated")
+var ErrOutOfRange = errors.New("out of range")
+
+type Pnl struct {
+	Fee    float64
+	Profit float64
+}
+
 type Strategy interface {
 	Enter(price float64)
-	OnTick(*Tick)
-	DumpPnl()
+	OnTick(*Tick) error
+	GetPnl() Pnl
 }
 
 type Grid struct {
@@ -61,7 +70,8 @@ type Grid struct {
 
 	InitialMargin float64
 	EntryPrice    float64
-	Quantity      float64 // TODO: InitialMargin * Leverage / Number
+	Quantity      float64 // Qty Per Order
+	// TODO: InitialMargin * Leverage / Number
 
 	// running
 	PendingOrders list[Order]
@@ -113,15 +123,14 @@ func (g *Grid) Enter(price float64) {
 	}
 }
 
-func (g *Grid) Place(side Side, n int) {
+func (g *Grid) place(side Side, n int) {
 	g.PendingOrders[g.Current].Side = Unknown
 	g.PendingOrders[n].Side = side
 }
+func (g *Grid) check() bool {
+	// TODO:
+	// https://www.binance.com/en/support/faq/how-to-calculate-liquidation-price-of-usd%E2%93%A2-m-futures-contracts-b3c689c1f50a44cabb3a84e663b81d93
 
-func (g *Grid) grid() float64 {
-	return (g.High - g.Low) / float64(g.Number)
-}
-func (g *Grid) DumpPnl() {
 	target := 0.0
 	pnl := 0.0
 	fee := 0.0
@@ -139,15 +148,38 @@ func (g *Grid) DumpPnl() {
 			fee += q * 0.0002
 		}
 	}
-	fmt.Printf("target: %4.2f\n", target)
-	fmt.Printf("fee: %4.2f\n", fee)
-	last := target*g.LastPrice + pnl - fee
-	fmt.Printf("pnl: %4.2f\n", last)
+
+	// if current value < -0.5 of initial margin maybe liquidate
+	return target*g.LastPrice+pnl-fee > -g.InitialMargin*0.5
 }
 
-func (g *Grid) OnTick(t *Tick) {
+func (g *Grid) grid() float64 {
+	return (g.High - g.Low) / float64(g.Number)
+}
+func (g *Grid) GetPnl() Pnl {
+	target := 0.0
+	pnl := 0.0
+	fee := 0.0
+	for i := 0; i < len(g.History); i++ {
+		o := &g.History[i]
+
+		if o.Side == Buy {
+			fee += o.Quantity * 0.0005
+			target += o.QuoteQty
+			pnl -= o.Quantity
+		} else if o.Side == Sell {
+			q := o.QuoteQty * o.Price
+			target -= o.QuoteQty
+			pnl += q
+			fee += q * 0.0002
+		}
+	}
+	return Pnl{Fee: fee, Profit: target*g.LastPrice + pnl - fee}
+}
+
+func (g *Grid) OnTick(t *Tick) error {
 	// look up
-	if g.Current < g.Number && t.Open >= g.PendingOrders[g.Current+1].Price {
+	if g.Current >= 0 && g.Current < g.Number && t.Open >= g.PendingOrders[g.Current+1].Price {
 		g.History.Add(g.PendingOrders[g.Current+1])
 		g.PendingOrders[g.Current+1].Side = Unknown
 		g.PendingOrders[g.Current].Side = Buy
@@ -162,16 +194,31 @@ func (g *Grid) OnTick(t *Tick) {
 	} else {
 		g.LastPrice = t.Open
 	}
+
+	if !g.check() {
+		return ErrLiquidated
+	}
+	return nil
 }
 
-func Dump(s Strategy, cht chan Tick) {
-	//
-	t := <-cht
+func Run(s Strategy, d DataBase) (Pnl, error) {
+	t, err := d.FetchOne()
+	if err != nil {
+		return Pnl{}, err
+	}
 	s.Enter(t.Close)
 
-	for t := range cht {
-		s.OnTick(&t)
+	for {
+		t, err = d.FetchOne()
+		if err == io.EOF {
+			err = nil
+			break
+		}
+
+		if err = s.OnTick(&t); err != nil {
+			break
+		}
 	}
 
-	s.DumpPnl()
+	return s.GetPnl(), err
 }
